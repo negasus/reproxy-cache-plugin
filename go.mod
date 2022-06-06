@@ -12,4 +12,4 @@ require (
 	github.com/go-pkgz/repeater v1.1.3 // indirect
 )
 
-replace github.com/umputun/reproxy => ../reproxy
+replace github.com/umputun/reproxy => ../reproxy-negasus

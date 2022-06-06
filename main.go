@@ -3,12 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
+
+	log "github.com/go-pkgz/lgr"
 
 	"github.com/umputun/go-flags"
 	"github.com/umputun/reproxy/lib"
@@ -16,21 +15,41 @@ import (
 
 var version = "unknown"
 
+/*
+Rule format:
+<path> <methods> <timeout> [<cache errors>]
+
+<path> 			- route (request.Route value)
+<methods> 		- http methods, | separated
+<timeout> 		- time duration
+<cache errors> 	- string 'yes' or omit
+
+http://127.0.0.1:2000/foo GET 60s
+http://127.0.0.1:2000/foo GET|POST 60s yes
+*/
+
 var opts struct {
-	Listen         string `short:"l" long:"listen" env:"LISTEN" description:"listen on host:port" default:"0.0.0.0:8080"`
-	ReproxyAddress string `short:"r" long:"reproxy" env:"REPROXY" description:"reproxy plugins endpoint" default:"http://127.0.0.1:8081"`
+	Listen         string   `short:"l" long:"listen" env:"LISTEN" description:"listen on host:port" default:"0.0.0.0:8080"`
+	ReproxyAddress string   `short:"a" long:"reproxy" env:"REPROXY" description:"reproxy plugins endpoint" default:"http://127.0.0.1:8081"`
+	Rules          []string `short:"r" long:"rules" env:"RULES" description:"cache rules"`
+	Dbg            bool     `long:"dbg" env:"DEBUG" description:"debug mode"`
 }
 
-type cacheItem struct {
-	deadline time.Time
-	body     []byte
-	headers  http.Header
+type rule struct {
+	methods     map[string]struct{}
+	timeout     time.Duration
+	cacheErrors bool
 }
 
-var (
-	mx    *sync.RWMutex
-	cache map[string]*cacheItem
-)
+type storage interface {
+	Get(key string) (*item, error)
+	Put(key string, i *item) error
+}
+
+type Handler struct {
+	storage storage
+	rules   map[string]rule
+}
 
 func main() {
 	fmt.Printf("reproxy-cache-plugin %s\n", version)
@@ -44,10 +63,9 @@ func main() {
 		os.Exit(2)
 	}
 
-	log.Printf("options: %#v", opts)
+	setupLog(opts.Dbg)
 
-	mx = &sync.RWMutex{}
-	cache = make(map[string]*cacheItem)
+	log.Printf("[INFO] options: %#v", opts)
 
 	err := run()
 	if err != nil {
@@ -62,7 +80,16 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := &Handler{}
+	h := &Handler{
+		storage: newStorageMemory(ctx),
+		rules:   map[string]rule{},
+	}
+
+	errParseRules := h.parseRules(opts.Rules)
+	if errParseRules != nil {
+		log.Printf("[ERROR] error parse rules: %v", errParseRules)
+		os.Exit(2)
+	}
 
 	go func() {
 		if x := recover(); x != nil {
@@ -75,63 +102,19 @@ func run() error {
 	}()
 
 	plugin := lib.Plugin{
-		Name:    "cache",
-		Address: opts.Listen,
-		Methods: []string{"Before", "After.Tail"},
+		Name:        "cache",
+		Address:     opts.Listen,
+		Methods:     []string{"Before"},
+		TailMethods: []string{"After"},
 	}
 
 	return plugin.Do(ctx, opts.ReproxyAddress, h)
 }
 
-type Handler struct{}
-
-func (h *Handler) Before(req lib.Request, res *lib.Response) (err error) {
-	fmt.Printf(">> before\n")
-	if req.Method != http.MethodGet {
-		return nil
+func setupLog(dbg bool) {
+	if dbg {
+		log.Setup(log.Debug, log.CallerFile, log.CallerFunc, log.Msec, log.LevelBraces)
+		return
 	}
-
-	mx.RLock()
-	defer mx.RUnlock()
-
-	fmt.Printf("find in cache %s\n", req.URL)
-
-	item, ok := cache[req.URL]
-	if ok && item.deadline.After(time.Now()) {
-		fmt.Printf("find in cache %s - FOUND\n", req.URL)
-		res.Body = item.body
-		res.StatusCode = http.StatusOK
-		res.HeadersOut = item.headers
-		res.Break = true
-		return nil
-
-	}
-
-	fmt.Printf("find in cache %s - NOT FOUND\n", req.URL)
-
-	return nil
-}
-
-func (h *Handler) After(req lib.Request, res *lib.Response) (err error) {
-	fmt.Printf(">> after\n")
-	if req.Method != http.MethodGet {
-		return nil
-	}
-
-	mx.Lock()
-	defer mx.Unlock()
-
-	fmt.Printf("add to cache %s\n", req.URL)
-
-	cache[req.URL] = &cacheItem{
-		deadline: time.Now().Add(time.Second * 5),
-		body:     res.Body,
-		headers:  res.HeadersOut,
-	}
-
-	res.StatusCode = req.ResponseCode
-	res.Body = req.ResponseBody
-	res.HeadersOut = req.ResponseHeaders
-
-	return
+	log.Setup(log.Msec, log.LevelBraces)
 }
